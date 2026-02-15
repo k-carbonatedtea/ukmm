@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use join_str::jstr;
 use roead::aamp::*;
@@ -37,9 +37,12 @@ pub struct ElementParams {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 
 pub struct Element {
-    pub params:   ElementParams,
-    pub children: Option<BTreeMap<usize, Element>>,
-    pub extend:   Option<ParameterList>,
+    pub params:            ElementParams,
+    pub children:          Option<BTreeMap<usize, Element>>,
+    pub extend:            Option<ParameterList>,
+    /// Keys present in base but missing in mod; only set in diff output. Merge removes these.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deleted_children: Option<BTreeSet<usize>>,
 }
 
 impl Element {
@@ -77,13 +80,22 @@ impl Element {
                         .collect::<Result<_>>()
                 })
                 .transpose()?,
-            extend:   list.list("Extend").cloned(),
+            extend:            list.list("Extend").cloned(),
+            deleted_children:  None,
         })
     }
 }
 
 impl Mergeable for Element {
     fn diff(&self, other: &Self) -> Self {
+        let deleted_children = match (&self.children, &other.children) {
+            (Some(sc), Some(oc)) => {
+                let d: BTreeSet<usize> =
+                    sc.keys().filter(|k| !oc.contains_key(k)).copied().collect();
+                if d.is_empty() { None } else { Some(d) }
+            }
+            _ => None,
+        };
         Self {
             params:   other.params.clone(),
             children: other.children.as_ref().map(|other_children| {
@@ -113,6 +125,7 @@ impl Mergeable for Element {
                     .map(|self_extend| util::diff_plist(self_extend, other_extend))
                     .unwrap_or_else(|| other_extend.clone())
             }),
+            deleted_children,
         }
     }
 
@@ -123,25 +136,38 @@ impl Mergeable for Element {
                 self.children
                     .as_ref()
                     .map(|self_children| {
-                        self_children
+                        // Union of keys, then remove any in diff.deleted_children (base had, mod removed).
+                        let mut merged: BTreeMap<usize, Element> = self_children
                             .iter()
                             .map(|(i, self_v)| {
-                                if let Some(other_v) = diff_children.get(i) {
-                                    (*i, self_v.merge(other_v))
+                                if let Some(diff_v) = diff_children.get(i) {
+                                    (*i, self_v.merge(diff_v))
                                 } else {
                                     (*i, self_v.clone())
                                 }
                             })
-                            .collect()
+                            .collect();
+                        for (k, diff_v) in diff_children.iter() {
+                            if !merged.contains_key(k) {
+                                merged.insert(*k, diff_v.clone());
+                            }
+                        }
+                        if let Some(deleted) = &diff.deleted_children {
+                            for k in deleted {
+                                merged.remove(k);
+                            }
+                        }
+                        merged
                     })
                     .unwrap_or_else(|| diff_children.clone())
             }),
-            extend:   diff.extend.as_ref().map(|diff_extend| {
+            extend:            diff.extend.as_ref().map(|diff_extend| {
                 self.extend
                     .as_ref()
                     .map(|self_extend| util::merge_plist(self_extend, diff_extend))
                     .unwrap_or_else(|| diff_extend.clone())
             }),
+            deleted_children:  None,
         }
     }
 }
@@ -189,6 +215,7 @@ impl From<AS> for ParameterIO {
                 params,
                 children,
                 extend,
+                deleted_children: _, // only used in diff/merge, not serialized
             } = element;
             let should_hack = params.type_index == 94 && index == 0;
             let mut list = ParameterList::new();
